@@ -7,7 +7,7 @@ Detect and kill orphan AI coding assistant processes before they eat all your RA
 
 ---
 
-![opencode-threads](Pics/opencode-threads-2945224.jpg)
+![opencode-threads](pics/opencode-threads-2945224.jpg)
 
 ## The Problem
 
