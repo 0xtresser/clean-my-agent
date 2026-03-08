@@ -1,0 +1,482 @@
+#!/usr/bin/env bash
+# clean-my-agent — Detect and kill orphan AI coding assistant processes
+# https://github.com/anthropics/clean-my-agent
+#
+# Supports: OpenCode, Claude Code, Codex
+# Platform: macOS + Linux
+#
+# How it works:
+#   For each AI tool process, walks up the process tree to find its shell
+#   ancestor. If that shell has lost its controlling terminal (tty == "??"),
+#   the process is orphaned — typically from closing a terminal tab without
+#   properly exiting the tool (Ctrl+C / /quit / exit).
+#
+#   Active sessions and their sub-agents are never affected.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+PROGNAME="clean-my-agent"
+
+# ─── Colors ──────────────────────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# Auto-disable colors when not a terminal
+if [[ ! -t 1 ]] || [[ "${NO_COLOR:-}" == "1" ]]; then
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; DIM=''; NC=''
+fi
+
+# ─── Defaults ────────────────────────────────────────────────────────────
+
+TOOLS="opencode,claude,codex"
+GRACE=30
+INTERVAL=60
+VERBOSE=false
+COMMAND=""
+PIDFILE="${TMPDIR:-/tmp}/clean-my-agent-guard.pid"
+
+# ─── Output Helpers ──────────────────────────────────────────────────────
+
+info()    { printf "  ${BLUE}ℹ${NC}  %b\n" "$*"; }
+success() { printf "  ${GREEN}✓${NC}  %b\n" "$*"; }
+warn()    { printf "  ${YELLOW}!${NC}  %b\n" "$*"; }
+fail()    { printf "  ${RED}✗${NC}  %b\n" "$*" >&2; }
+dim()     { printf "  ${DIM}%b${NC}\n" "$*"; }
+
+fmt_mem() {
+  local kb=${1:-0}
+  if (( kb >= 1048576 )); then
+    awk "BEGIN { printf \"%.1f GB\", $kb / 1048576 }"
+  elif (( kb >= 1024 )); then
+    awk "BEGIN { printf \"%.0f MB\", $kb / 1024 }"
+  else
+    printf "%d KB" "$kb"
+  fi
+}
+
+# ─── Core: Find Orphan Processes ─────────────────────────────────────────
+#
+# Captures a ps snapshot, then uses awk to:
+#   1. Build a process tree lookup
+#   2. Identify candidate processes matching tool patterns
+#   3. Pre-filter: skip candidates that have a real tty (definitely active)
+#   4. Walk each candidate's ancestor chain to find its shell
+#   5. If shell has no tty → orphan
+#   6. Apply grace period filter
+#
+# Output: tab-separated lines
+#   pid \t tty \t etime \t rss_kb \t tool \t command
+
+find_orphans() {
+  local tools_pattern="$1"
+  local grace_secs="$2"
+  local my_pid="$$"
+  local my_user
+  my_user="$(whoami)"
+
+  # Capture snapshot BEFORE awk starts (so awk itself doesn't appear)
+  local snapshot
+  snapshot=$(ps -eo pid,ppid,tty,etime,rss,user,args 2>/dev/null) || return 0
+
+  printf '%s\n' "$snapshot" | awk \
+    -v pattern="$tools_pattern" \
+    -v grace="$grace_secs" \
+    -v my_pid="$my_pid" \
+    -v my_user="$my_user" \
+  '
+  function strip_path(s) { gsub(/.*\//, "", s); return s }
+  function strip_dash(s) { sub(/^-/, "", s); return s }
+
+  function is_shell(cmd,    b) {
+    b = strip_dash(strip_path(cmd))
+    return b ~ /^(zsh|bash|fish|sh|dash|tcsh|csh|ksh)$/
+  }
+
+  function parse_etime(s,    n, p) {
+    # Format: [[DD-]HH:]MM:SS → convert to seconds
+    gsub(/-/, ":", s)
+    n = split(s, p, ":")
+    if (n == 2) return p[1]*60 + p[2]
+    if (n == 3) return p[1]*3600 + p[2]*60 + p[3]
+    if (n == 4) return p[1]*86400 + p[2]*3600 + p[3]*60 + p[4]
+    return 0
+  }
+
+  function detect_tool(s,    l) {
+    l = tolower(s)
+    # Exclude ourselves
+    if (l ~ /clean-my-agent/) return ""
+    if (l ~ /opencode/) return "opencode"
+    if (l ~ /claude/)   return "claude"
+    if (l ~ /codex/)    return "codex"
+    return ""
+  }
+
+  NR > 1 {
+    pid  = $1
+    pp   = $2
+    tty  = $3
+    et   = $4
+    rss  = $5
+    user = $6
+    args = ""
+    for (i = 7; i <= NF; i++) args = (args ? args " " : "") $i
+
+    # Only process current user
+    if (user != my_user) next
+
+    # Store in lookup tables
+    PP[pid] = pp
+    TT[pid] = tty
+    ET[pid] = et
+    MEM[pid] = rss
+    AR[pid] = args
+    CM[pid] = $7   # first word of args (the executable)
+
+    # Identify tool candidates (exclude self)
+    tool = detect_tool(args)
+    if (tool != "" && pid != my_pid && tool ~ pattern) {
+      # Pre-filter: if process has a real tty, it is definitely alive
+      if (tty != "??" && tty != "?") next
+      CAND[pid] = tool
+    }
+  }
+
+  END {
+    for (pid in CAND) {
+      cur = pid
+      alive = 0
+
+      # Walk up the ancestor chain to find a shell
+      for (depth = 0; depth < 50; depth++) {
+        if (cur == "" || cur == "0" || cur == "1") break
+        if (is_shell(CM[cur])) {
+          # Found shell ancestor — check its tty
+          if (TT[cur] != "??" && TT[cur] != "?") alive = 1
+          break
+        }
+        cur = PP[cur]
+      }
+
+      if (!alive) {
+        secs = parse_etime(ET[pid])
+        if (secs >= grace) {
+          printf "%s\t%s\t%s\t%s\t%s\t%s\n", \
+            pid, TT[pid], ET[pid], MEM[pid], CAND[pid], AR[pid]
+        }
+      }
+    }
+  }
+  '
+}
+
+# ─── Commands ────────────────────────────────────────────────────────────
+
+cmd_scan() {
+  local pattern
+  pattern=$(echo "$TOOLS" | tr ',' '|')
+
+  printf "\n${BOLD}  🔍 Scanning for orphan processes...${NC}\n"
+  dim "Tools: $(echo "$TOOLS" | tr ',' ', ') | Grace period: ${GRACE}s"
+  printf "\n"
+
+  local orphans
+  orphans=$(find_orphans "$pattern" "$GRACE")
+
+  if [ -z "$orphans" ]; then
+    success "No orphan processes found. All clean!"
+    printf "\n"
+    return 0
+  fi
+
+  # Table header
+  printf "  ${DIM}%-10s %-8s %10s %10s  %-s${NC}\n" \
+    "TOOL" "PID" "MEMORY" "AGE" "COMMAND"
+  printf "  ${DIM}%-10s %-8s %10s %10s  %-s${NC}\n" \
+    "──────────" "────────" "──────────" "──────────" "──────────────────────────────"
+
+  local total_kb=0
+  local count=0
+
+  while IFS=$'\t' read -r pid tty etime rss_kb tool cmd; do
+    local mem
+    mem=$(fmt_mem "$rss_kb")
+    # Truncate command if too long
+    local display_cmd
+    if [ ${#cmd} -gt 60 ]; then
+      display_cmd="…${cmd: -59}"
+    else
+      display_cmd="$cmd"
+    fi
+    printf "  ${CYAN}%-10s${NC} %-8s ${YELLOW}%10s${NC} %10s  ${DIM}%s${NC}\n" \
+      "$tool" "$pid" "$mem" "$etime" "$display_cmd"
+    total_kb=$((total_kb + rss_kb))
+    count=$((count + 1))
+  done <<< "$orphans"
+
+  printf "\n"
+  local total_mem
+  total_mem=$(fmt_mem "$total_kb")
+  warn "Found ${BOLD}$count${NC}${YELLOW} orphan process(es) using ${BOLD}~$total_mem${NC}"
+  info "Run '${BOLD}$PROGNAME clean${NC}' to terminate them."
+  printf "\n"
+}
+
+cmd_clean() {
+  local pattern
+  pattern=$(echo "$TOOLS" | tr ',' '|')
+
+  printf "\n${BOLD}  🧹 Cleaning orphan processes...${NC}\n\n"
+
+  local orphans
+  orphans=$(find_orphans "$pattern" "$GRACE")
+
+  if [ -z "$orphans" ]; then
+    success "No orphan processes found. All clean!"
+    printf "\n"
+    return 0
+  fi
+
+  local total_kb=0
+  local count=0
+  local failed=0
+
+  while IFS=$'\t' read -r pid tty etime rss_kb tool cmd; do
+    local mem
+    mem=$(fmt_mem "$rss_kb")
+    if kill "$pid" 2>/dev/null; then
+      success "Killed ${BOLD}$tool${NC}${GREEN} (PID $pid, $mem)"
+      total_kb=$((total_kb + rss_kb))
+      count=$((count + 1))
+    else
+      fail "Failed to kill $tool (PID $pid) — may have already exited"
+      failed=$((failed + 1))
+    fi
+  done <<< "$orphans"
+
+  printf "\n"
+  if [ "$count" -gt 0 ]; then
+    local total_mem
+    total_mem=$(fmt_mem "$total_kb")
+    success "Cleaned ${BOLD}$count${NC}${GREEN} process(es), freed ~${BOLD}$total_mem${NC}"
+  fi
+  [ "$failed" -gt 0 ] && warn "$failed process(es) could not be killed"
+  printf "\n"
+}
+
+cmd_guard() {
+  local pattern
+  pattern=$(echo "$TOOLS" | tr ',' '|')
+
+  # Prevent multiple guard instances
+  if [ -f "$PIDFILE" ]; then
+    local existing_pid
+    existing_pid=$(cat "$PIDFILE")
+    if kill -0 "$existing_pid" 2>/dev/null; then
+      warn "Guard is already running (PID $existing_pid)."
+      info "Use '${BOLD}$PROGNAME unguard${NC}' to stop it first."
+      printf "\n"
+      return 1
+    else
+      rm -f "$PIDFILE"
+    fi
+  fi
+
+  # Write PID file and register cleanup
+  echo $$ > "$PIDFILE"
+  trap 'rm -f "$PIDFILE"; printf "\n"; info "Guard stopped."; printf "\n"; exit 0' INT TERM
+  trap 'rm -f "$PIDFILE"' EXIT
+
+  printf "\n${BOLD}  🛡️  Guard mode active${NC}\n"
+  dim "Tools: $(echo "$TOOLS" | tr ',' ', ') | Interval: ${INTERVAL}s | Grace: ${GRACE}s"
+  dim "PID: $$ | Stop with: $PROGNAME unguard"
+  printf "\n"
+
+  while true; do
+    local ts
+    ts=$(date '+%H:%M:%S')
+
+    local orphans
+    orphans=$(find_orphans "$pattern" "$GRACE")
+
+    if [ -z "$orphans" ]; then
+      dim "[$ts] Scan: no orphans"
+    else
+      local count=0
+      local total_kb=0
+
+      while IFS=$'\t' read -r pid tty etime rss_kb tool cmd; do
+        kill "$pid" 2>/dev/null || true
+        total_kb=$((total_kb + rss_kb))
+        count=$((count + 1))
+      done <<< "$orphans"
+
+      local total_mem
+      total_mem=$(fmt_mem "$total_kb")
+      printf "  ${GREEN}✓${NC}  [$ts] Cleaned $count orphan(s) — freed ~$total_mem\n"
+    fi
+
+    sleep "$INTERVAL"
+  done
+}
+
+cmd_unguard() {
+  if [ ! -f "$PIDFILE" ]; then
+    info "No guard process running."
+    printf "\n"
+    return 0
+  fi
+
+  local pid
+  pid=$(cat "$PIDFILE")
+
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null
+    rm -f "$PIDFILE"
+    success "Guard stopped (PID $pid)."
+  else
+    rm -f "$PIDFILE"
+    info "Guard (PID $pid) already exited. Cleaned up stale PID file."
+  fi
+  printf "\n"
+}
+
+# ─── Usage ───────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+
+${BOLD}  $PROGNAME${NC} v$VERSION
+  Detect and kill orphan AI coding assistant processes.
+
+${BOLD}  USAGE${NC}
+    $PROGNAME <command> [options]
+
+${BOLD}  COMMANDS${NC}
+    scan       Detect orphan processes (dry-run, no killing)
+    clean      Detect and kill orphan processes
+    guard      Run as daemon, periodically scan and clean
+    unguard    Stop a running guard process
+
+${BOLD}  OPTIONS${NC}
+    -t, --tools <list>      Tools to scan (default: opencode,claude,codex)
+    -g, --grace <seconds>   Skip processes younger than N seconds (default: 30)
+    -i, --interval <secs>   Guard mode check interval (default: 60)
+    -v, --verbose           Verbose output
+    -h, --help              Show this help
+    --version               Show version
+
+${BOLD}  EXAMPLES${NC}
+    $PROGNAME scan                        # Preview all orphans
+    $PROGNAME clean                       # Kill all orphans
+    $PROGNAME clean -t opencode           # Only clean OpenCode
+    $PROGNAME clean -t opencode,claude    # Clean OpenCode + Claude Code
+    $PROGNAME guard                       # Auto-clean every 60s
+    $PROGNAME guard -i 120 -t opencode    # Guard OpenCode every 2 min
+    $PROGNAME unguard                     # Stop the guard
+
+${BOLD}  HOW IT WORKS${NC}
+    For each AI tool process, walks up the process tree to find its shell
+    ancestor (zsh, bash, fish, etc). If that shell has no controlling
+    terminal (tty == "??"), the process is orphaned — typically from
+    closing a terminal tab without properly exiting the tool.
+
+    Active sessions and their sub-agents are never affected.
+
+${BOLD}  SUPPORTED TOOLS${NC}
+    opencode    OpenCode CLI (opencode.ai)
+    claude      Claude Code (Anthropic)
+    codex       Codex CLI (OpenAI)
+
+EOF
+}
+
+# ─── Argument Parsing ────────────────────────────────────────────────────
+
+parse_args() {
+  if [ $# -eq 0 ]; then
+    usage
+    exit 0
+  fi
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      scan|clean|guard|unguard)
+        COMMAND="$1"
+        shift
+        ;;
+      -t|--tools)
+        if [ -z "${2:-}" ]; then
+          fail "--tools requires a value (e.g., opencode,claude,codex)"
+          exit 1
+        fi
+        TOOLS="$2"
+        shift 2
+        ;;
+      -g|--grace)
+        if [ -z "${2:-}" ]; then
+          fail "--grace requires a value in seconds"
+          exit 1
+        fi
+        GRACE="$2"
+        shift 2
+        ;;
+      -i|--interval)
+        if [ -z "${2:-}" ]; then
+          fail "--interval requires a value in seconds"
+          exit 1
+        fi
+        INTERVAL="$2"
+        shift 2
+        ;;
+      -v|--verbose)
+        VERBOSE=true
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --version)
+        echo "$PROGNAME $VERSION"
+        exit 0
+        ;;
+      *)
+        fail "Unknown argument: $1"
+        printf "\n"
+        usage
+        exit 1
+        ;;
+    esac
+  done
+
+  if [ -z "$COMMAND" ]; then
+    fail "No command specified. Use: scan, clean, guard, or unguard"
+    printf "\n"
+    usage
+    exit 1
+  fi
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────
+
+main() {
+  parse_args "$@"
+
+  case "$COMMAND" in
+    scan)    cmd_scan    ;;
+    clean)   cmd_clean   ;;
+    guard)   cmd_guard   ;;
+    unguard) cmd_unguard ;;
+  esac
+}
+
+main "$@"
