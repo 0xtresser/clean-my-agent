@@ -24,6 +24,10 @@ const SHELLS = new Set(["zsh", "bash", "fish", "sh", "dash", "tcsh", "csh", "ksh
 const COOLDOWN_MS = 10_000;
 const GRACE_SECS = 30;
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function isShell(comm) {
   const base = comm.replace(/^-/, "").split("/").pop();
   return SHELLS.has(base);
@@ -54,6 +58,43 @@ function parseEtime(etime) {
     case 4: return parts[0] * 86400 + parts[1] * 3600 + parts[2] * 60 + parts[3];
     default: return 0;
   }
+}
+
+function processExists(pid) {
+  try {
+    process.kill(Number(pid), 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForExit(pid, attempts = 10, delayMs = 100) {
+  for (let i = 0; i < attempts; i++) {
+    if (!processExists(pid)) return true;
+    await sleep(delayMs);
+  }
+  return !processExists(pid);
+}
+
+async function killOrphan(pid) {
+  if (!processExists(pid)) return true;
+
+  try {
+    process.kill(Number(pid), "SIGTERM");
+  } catch {
+    return false;
+  }
+
+  if (await waitForExit(pid, 15, 100)) return true;
+
+  try {
+    process.kill(Number(pid), "SIGKILL");
+  } catch {
+    return false;
+  }
+
+  return waitForExit(pid, 20, 100);
 }
 
 export const CleanMyAgentPlugin = async ({ $, client }) => {
@@ -144,11 +185,7 @@ export const CleanMyAgentPlugin = async ({ $, client }) => {
       try {
         const pids = await scanOrphans();
         for (const pid of pids) {
-          try {
-            await $`kill ${pid}`.quiet();
-          } catch {
-            // Process may have already exited
-          }
+          await killOrphan(pid);
         }
       } catch {
         // Never disrupt the user's session

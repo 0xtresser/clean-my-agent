@@ -62,6 +62,57 @@ fmt_mem() {
   fi
 }
 
+process_exists() {
+  local pid="$1"
+  kill -0 "$pid" 2>/dev/null
+}
+
+wait_for_exit() {
+  local pid="$1"
+  local attempts="${2:-10}"
+  local delay="${3:-0.1}"
+
+  local i
+  for ((i = 0; i < attempts; i++)); do
+    if ! process_exists "$pid"; then
+      return 0
+    fi
+    sleep "$delay"
+  done
+
+  ! process_exists "$pid"
+}
+
+kill_orphan() {
+  local pid="$1"
+  KILL_METHOD=""
+
+  if ! process_exists "$pid"; then
+    KILL_METHOD="already exited"
+    return 0
+  fi
+
+  if ! kill -TERM "$pid" 2>/dev/null; then
+    return 1
+  fi
+
+  if wait_for_exit "$pid" 15 0.1; then
+    KILL_METHOD="SIGTERM"
+    return 0
+  fi
+
+  if ! kill -KILL "$pid" 2>/dev/null; then
+    return 1
+  fi
+
+  if wait_for_exit "$pid" 20 0.1; then
+    KILL_METHOD="SIGKILL"
+    return 0
+  fi
+
+  return 1
+}
+
 # ─── Core: Find Orphan Processes ─────────────────────────────────────────
 #
 # Captures a ps snapshot, then uses awk to:
@@ -248,16 +299,17 @@ cmd_clean() {
   local total_kb=0
   local count=0
   local failed=0
+  local KILL_METHOD=""
 
   while IFS=$'\t' read -r pid tty etime rss_kb tool cmd; do
     local mem
     mem=$(fmt_mem "$rss_kb")
-    if kill "$pid" 2>/dev/null; then
-      success "Killed ${BOLD}$tool${NC}${GREEN} (PID $pid, $mem)"
+    if kill_orphan "$pid"; then
+      success "Killed ${BOLD}$tool${NC}${GREEN} (PID $pid, $mem, $KILL_METHOD)"
       total_kb=$((total_kb + rss_kb))
       count=$((count + 1))
     else
-      fail "Failed to kill $tool (PID $pid) — may have already exited"
+      fail "Failed to kill $tool (PID $pid) — process is still running"
       failed=$((failed + 1))
     fi
   done <<< "$orphans"
@@ -312,16 +364,25 @@ cmd_guard() {
     else
       local count=0
       local total_kb=0
+      local failed=0
+      local KILL_METHOD=""
 
       while IFS=$'\t' read -r pid tty etime rss_kb tool cmd; do
-        kill "$pid" 2>/dev/null || true
-        total_kb=$((total_kb + rss_kb))
-        count=$((count + 1))
+        if kill_orphan "$pid"; then
+          total_kb=$((total_kb + rss_kb))
+          count=$((count + 1))
+        else
+          failed=$((failed + 1))
+        fi
       done <<< "$orphans"
 
       local total_mem
       total_mem=$(fmt_mem "$total_kb")
-      printf "  ${GREEN}✓${NC}  [$ts] Cleaned $count orphan(s) — freed ~$total_mem\n"
+      if [ "$failed" -gt 0 ]; then
+        printf "  ${YELLOW}!${NC}  [$ts] Cleaned $count orphan(s), $failed failed — freed ~$total_mem\n"
+      else
+        printf "  ${GREEN}✓${NC}  [$ts] Cleaned $count orphan(s) — freed ~$total_mem\n"
+      fi
     fi
 
     sleep "$INTERVAL"
